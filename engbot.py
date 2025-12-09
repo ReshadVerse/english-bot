@@ -5,8 +5,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # --- БЕРЕМ КЛЮЧИ ИЗ СИСТЕМЫ (БЕЗОПАСНО) ---
-GEMINI_API_KEY = os.getenv("AIzaSyBUxfn_IOZf4g8Jxv5JpPOsQdle1KKqugc")
-TELEGRAM_TOKEN = os.getenv("8560503040:AAHDeKYHrLACF42Lt_1nbI6H1d7ARIuHOHQ")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not GEMINI_API_KEY or not TELEGRAM_TOKEN:
     raise ValueError("Ключи не найдены! Проверь переменные окружения.")
