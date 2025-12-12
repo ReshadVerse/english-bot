@@ -18,7 +18,10 @@ if not GEMINI_API_KEY or not TELEGRAM_TOKEN:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- ТВОЙ ОРИГИНАЛЬНЫЙ ПРОМПТ (С небольшим дополнением про аудио) ---
+# Глобальная переменная для хранения последнего ответа (чтобы озвучивать длинные тексты)
+# Format: {chat_id: "текст ответа"}
+TTS_CACHE = {}
+
 SYSTEM_PROMPT = """
 Ты — профессиональный репетитор английского языка для уровня B2-C1.
 Твоя задача — не просто переводить, а объяснять нюансы.
@@ -35,9 +38,8 @@ SYSTEM_PROMPT = """
    - Если есть ошибки в речи, мягко исправь их.
 """
 
-# Используем твою любимую модель (она умеет работать с аудио!)
 model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
+    model_name="gemini-2.5-flash", # Твоя рабочая модель
     system_instruction=SYSTEM_PROMPT
 )
 
@@ -54,16 +56,13 @@ def run_web_server():
 
 # --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-# Функция для создания кнопки "Озвучить"
-def get_pronounce_keyboard(text_to_speak):
-    # Ограничиваем длину текста для кнопки (Telegram имеет лимиты на данные в кнопках)
-    callback_data = f"tts|{text_to_speak[:50]}" 
-    keyboard = []
+def get_pronounce_keyboard():
+    # Кнопка теперь не несет в себе текст, она просто сигнал "Озвучь последнее"
+    keyboard =[]
     return InlineKeyboardMarkup(keyboard)
 
-# Функция генерации речи (Edge TTS)
 async def generate_voice_file(text):
-    # Голос: en-US-ChristopherNeural (мужской) или en-US-AriaNeural (женский)
+    # Голос: en-US-ChristopherNeural (мужской)
     VOICE = "en-US-ChristopherNeural"
     output_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
     communicate = edge_tts.Communicate(text, VOICE)
@@ -83,85 +82,97 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Обработка ТЕКСТА
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    chat_id = update.effective_chat.id
+    
+    await context.bot.send_chat_action(chat_id=chat_id, action='typing')
 
     try:
         response = model.generate_content(user_text)
-        # Отправляем ответ с кнопкой "Произнести" (озвучиваем исходный запрос пользователя)
+        bot_reply = response.text
+        
+        # Сохраняем ответ в память, чтобы потом озвучить
+        TTS_CACHE[chat_id] = bot_reply
+        
         await update.message.reply_text(
-            response.text, 
-            reply_markup=get_pronounce_keyboard(user_text)
+            bot_reply, 
+            reply_markup=get_pronounce_keyboard()
         ) 
     except Exception as e:
         await update.message.reply_text(f"Ошибка мозга: {e}")
 
-# Обработка ГОЛОСОВЫХ (Новая фича!)
+# Обработка ГОЛОСОВЫХ (ИСПРАВЛЕНО)
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action='typing')
     
     try:
-        # 1. Скачиваем файл голосового
         voice_file = await context.bot.get_file(update.message.voice.file_id)
         
-        # Сохраняем во временный файл
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_audio:
             await voice_file.download_to_drive(custom_path=temp_audio.name)
             temp_audio_path = temp_audio.name
 
-        # 2. Загружаем файл в Gemini (через Files API или как байты - Flash 2.5 умеет принимать файлы)
-        # Для простоты и скорости загружаем как MIME data
         uploaded_file = genai.upload_file(temp_audio_path, mime_type="audio/ogg")
         
-        # 3. Отправляем в модель
         response = model.generate_content(
             ["Послушай это сообщение. Ответь на него. Если это вопрос на английском — ответь на английском.", uploaded_file]
         )
         
-        # Чистим за собой
         os.remove(temp_audio_path)
+        
+        bot_reply = response.text
+        
+        # 1. Сохраняем ответ в память
+        TTS_CACHE[chat_id] = bot_reply
 
-        # Отправляем ответ
-        await update.message.reply_text(f"🗣 **Ответ на войс:**\n\n{response.text}")
+        # 2. Отправляем ответ ТЕПЕРЬ С КНОПКОЙ (вот чего не хватало!)
+        await update.message.reply_text(
+            f"🗣 **Ответ на войс:**\n\n{bot_reply}",
+            reply_markup=get_pronounce_keyboard()
+        )
 
     except Exception as e:
         await update.message.reply_text(f"Не расслышал... Ошибка: {e}")
 
-# Обработка нажатия КНОПКИ
+# Обработка нажатия КНОПКИ (ИСПРАВЛЕНО ПОД НОВУЮ ЛОГИКУ)
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer() # Чтобы кнопка перестала мигать
+    chat_id = update.effective_chat.id
+    await query.answer()
 
-    data = query.data.split("|")
-    if data == "tts":
-        text_to_speak = data[1] # Текст, который мы зашили в кнопку
+    if query.data == "tts_last":
+        # Достаем текст из памяти
+        text_to_speak = TTS_CACHE.get(chat_id)
         
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='record_audio')
+        if not text_to_speak:
+            await context.bot.send_message(chat_id=chat_id, text="⚠ Нечего озвучивать (кэш пуст).")
+            return
+
+        await context.bot.send_chat_action(chat_id=chat_id, action='record_audio')
         
         try:
-            # Генерируем аудио
+            # Если текст очень длинный (больше 1000 символов), лучше обрезать, чтобы не зависло
+            if len(text_to_speak) > 1000:
+                text_to_speak = text_to_speak[:1000]
+            
             audio_path = await generate_voice_file(text_to_speak)
             
-            # Отправляем как голосовое
-            await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(audio_path, 'rb'))
-            
-            # Удаляем файл
+            await context.bot.send_voice(chat_id=chat_id, voice=open(audio_path, 'rb'))
             os.remove(audio_path)
             
         except Exception as e:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Ошибка озвучки: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=f"Ошибка озвучки: {e}")
 
 # --- ЗАПУСК ---
 if __name__ == '__main__':
-    # Запускаем веб-сервер в фоне
     threading.Thread(target=run_web_server).start()
     
-    print("Бот запускается...")
+    print("Бот запускается... (С ИСПРАВЛЕННОЙ КНОПКОЙ)")
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Регистрируем хендлеры
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text)) # Текст
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice)) # Голосовые
-    application.add_handler(CallbackQueryHandler(button_click)) # Кнопки
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(CallbackQueryHandler(button_click))
 
     application.run_polling()
