@@ -319,4 +319,3 @@ if __name__ == '__main__':
     except Exception as e:
         print("\n❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ:")
         print(traceback.format_exc())
-        input("\nНажми Enter, чтобы закрыть окно...")
