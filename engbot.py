@@ -2,12 +2,13 @@ import os
 import threading
 import tempfile
 import asyncio
-import traceback # ЧТОБЫ ВИДЕТЬ ОШИБКИ
+import traceback 
 from flask import Flask
 from dotenv import load_dotenv
 
-# Библиотеки AI
-import google.generativeai as genai
+# --- ИЗМЕНЕНИЕ 1: Новые импорты Google ---
+from google import genai
+from google.genai import types
 import edge_tts
 
 # Библиотеки Telegram
@@ -26,14 +27,19 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Проверка ключей (теперь не роняет скрипт молча)
+# Проверка ключей
 if not GEMINI_API_KEY:
     print("❌ ОШИБКА: Нет GEMINI_API_KEY в файле .env")
 if not TELEGRAM_TOKEN:
     print("❌ ОШИБКА: Нет TELEGRAM_TOKEN в файле .env")
 
+# --- ИЗМЕНЕНИЕ 2: Инициализация Клиента (вместо configure) ---
+client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"❌ Ошибка создания клиента Google: {e}")
 
 # Подключаем БД
 try:
@@ -82,12 +88,8 @@ SYSTEM_PROMPT = """
 Если слово имеет несколько значений (как "Shredded" — "уничтоженный в шредере" и "просушенный качок"), обязательно укажи оба перевода в пункте 1.
 """
 
-
-# Инициализация модели (с защитой)
-try:
-    model = genai.GenerativeModel("gemini-2.5-flash-lite", system_instruction=SYSTEM_PROMPT)
-except Exception as e:
-    print(f"❌ ОШИБКА AI МОДЕЛИ: {e}")
+# В новой версии модель не создается глобально как объект, мы используем client в функциях
+# Модель указывается при вызове (см. handle_text)
 
 # --- 2. FLASK SERVER ---
 app = Flask(__name__)
@@ -183,7 +185,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action='typing')
     try:
-        response = await model.generate_content_async(user_text)
+        # --- ИЗМЕНЕНИЕ 3: Новый вызов генерации текста ---
+        # Используем client.aio для асинхронности
+        response = await client.aio.models.generate_content(
+            model="gemini-2.0-flash", # Используем актуальную модель
+            contents=user_text,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT
+            )
+        )
+        
         context.user_data['last_reply'] = response.text
         context.user_data['last_input'] = user_text 
         await update.message.reply_text(response.text, reply_markup=get_keyboard())
@@ -198,9 +209,41 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tf:
             await file.download_to_drive(custom_path=tf.name)
             tpath = tf.name
-        g_file = genai.upload_file(tpath, mime_type="audio/ogg")
-        await asyncio.sleep(1)
-        resp = await model.generate_content_async(["Ответь на это аудио.", g_file])
+        
+        # --- ИЗМЕНЕНИЕ 4: Загрузка файла и генерация ---
+        # Загружаем файл через client.files
+        # Примечание: 'upload' обычно синхронный, но быстрый. 
+        # Если нужно строго async, используем client.aio.files.upload (если доступно в версии) или запускаем в executor.
+        # Для простоты используем client.files.upload (он работает надежно)
+        
+        # Загрузка
+        upload_file = client.files.upload(path=tpath, config={'mime_type': 'audio/ogg'})
+        
+        # Ждем обработки (обычно аудио быстро, но на всякий случай)
+        while upload_file.state.name == "PROCESSING":
+             await asyncio.sleep(1)
+             upload_file = client.files.get(name=upload_file.name)
+
+        # Генерация ответа
+        resp = await client.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_uri(
+                            file_uri=upload_file.uri,
+                            mime_type=upload_file.mime_type
+                        ),
+                        types.Part.from_text(text="Ответь на это аудио.")
+                    ]
+                )
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT
+            )
+        )
+        
         if os.path.exists(tpath): os.remove(tpath)
         context.user_data['last_reply'] = resp.text
         context.user_data['last_input'] = None 
@@ -229,42 +272,34 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "save":
         word = context.user_data.get('last_input')
         
-        # Защита от случайных нажатий
         if not word: return 
         
         await context.bot.send_chat_action(chat_id, action='typing')
 
-        # 1. Просим только перевод
         try:
-            # Используем ту же модель, просто просим дать ТОЛЬКО перевод
-            r = await model.generate_content_async(f"Translate '{word}' to Russian. Return ONLY the translation words. No definitions.")
-            trans = r.text.strip() # Чистим от пробелов
+            # --- ИЗМЕНЕНИЕ 5: Новый вызов для перевода ---
+            r = await client.aio.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=f"Translate '{word}' to Russian. Return ONLY the translation words. No definitions."
+            )
+            trans = r.text.strip()
         except:
             trans = "..."
 
-        # 2. Сохраняем
         if db.add_word(chat_id, word, trans):
             await context.bot.send_message(chat_id, f"✅ Сохранено: **{word}** — {trans}", parse_mode="Markdown")
         else:
             await context.bot.send_message(chat_id, "⚠ Такое слово уже есть.")
-    elif data.startswith("rev_ok_"):
-        wid = int(data.split("_")[-1])
-        db.update_word_stage(wid, 2)
-        await query.edit_message_text("🎉 Супер! Отложил на 3 дня.")
-    
     # 3. ИНТЕРВАЛЬНОЕ ПОВТОРЕНИЕ
     elif data.startswith("rev_ok_"):
         wid = int(data.split("_")[-1])
         
-        # 1. Получаем инфо о слове перед обновлением
         row = db.get_word_by_id(wid)
         
-        # 2. Обновляем статус
         db.update_word_stage(wid, 2) 
         
         if row:
             word, translation = row
-            # 3. Показываем перевод
             await query.edit_message_text(
                 f"🎉 Красавчик!\n\n✅ **{word}** — {translation}\n\n(Увидимся через 3 дня)",
                 parse_mode="Markdown"
@@ -297,8 +332,10 @@ if __name__ == '__main__':
         
         if not GEMINI_API_KEY or not TELEGRAM_TOKEN:
             print("❌ СТОП: Проверь ключи в .env")
-            input("Нажми Enter чтобы выйти...")
-            exit()
+            # --- ИЗМЕНЕНИЕ 6: Убрал input() чтобы Render не падал ---
+            # input("Нажми Enter чтобы выйти...") 
+            import sys
+            sys.exit(1)
 
         app_bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         
@@ -313,9 +350,12 @@ if __name__ == '__main__':
         app_bot.add_handler(MessageHandler(filters.VOICE, handle_voice))
         app_bot.add_handler(CallbackQueryHandler(button_click))
 
-        print("🚀 Бот работает! Нажми Ctrl+C для остановки.")
+        print("🚀 Бот работает!")
         app_bot.run_polling()
         
     except Exception as e:
         print("\n❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ:")
         print(traceback.format_exc())
+        # Блокировка, чтобы не перезагружать сервер в цикле
+        import time
+        time.sleep(10)
