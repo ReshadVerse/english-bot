@@ -188,7 +188,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- ИЗМЕНЕНИЕ 3: Новый вызов генерации текста ---
         # Используем client.aio для асинхронности
         response = await client.aio.models.generate_content(
-            model="gemini-3-flash", # Используем актуальную модель
+            model="gemini-2.5-flash", # Используем актуальную модель
             contents=user_text,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT
@@ -226,7 +226,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Генерация ответа
         resp = await client.aio.models.generate_content(
-            model="gemini-3-flash",
+            model="gemini-2.5-flash",
             contents=[
                 types.Content(
                     role="user",
@@ -279,7 +279,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # --- ИЗМЕНЕНИЕ 5: Новый вызов для перевода ---
             r = await client.aio.models.generate_content(
-                model="gemini-3-flash",
+                model="gemini-2.5-flash",
                 contents=f"Translate '{word}' to Russian. Return ONLY the translation words. No definitions."
             )
             trans = r.text.strip()
