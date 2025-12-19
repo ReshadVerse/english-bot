@@ -188,7 +188,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # --- ИЗМЕНЕНИЕ 3: Новый вызов генерации текста ---
         # Используем client.aio для асинхронности
         response = await client.aio.models.generate_content(
-            model="gemini-2.0-flash", # Используем актуальную модель
+            model="gemini-2.5-flash", # Используем актуальную модель
             contents=user_text,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT
