@@ -3,6 +3,7 @@ import threading
 import tempfile
 import asyncio
 import traceback 
+import re
 from flask import Flask
 from dotenv import load_dotenv
 
@@ -276,13 +277,31 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "tts":
         text = context.user_data.get('last_reply')
         if text:
-            clean = text.replace('*', '').replace('_', '')[:1000]
+            # --- ФИЛЬТР ЛИШНИХ ВЫРАЖЕНИЙ ---
+            # 1. Убираем markdown (*, _)
+            clean = text.replace('*', '').replace('_', '')
+            
+            # 2. Оставляем ТОЛЬКО английские буквы, цифры и знаки препинания.
+            # Все русские буквы (и пояснения типа "Оценка:") будут удалены.
+            # Регулярка [^...] значит "удалить всё, что НЕ входит в этот список"
+            clean_english_only = re.sub(r'[^\x00-\x7F]+', '', clean)
+            
+            # Обрезаем лишние пробелы, которые могли остаться после удаления слов
+            final_text = " ".join(clean_english_only.split())
+
+            if not final_text:
+                await query.answer("Нет английского текста для озвучки!")
+                return
+
             await context.bot.send_chat_action(chat_id, action='record_audio')
             try:
-                path = await generate_voice_file(clean)
-                with open(path, 'rb') as f: await context.bot.send_voice(chat_id, f)
+                # Озвучиваем только чистый английский текст
+                path = await generate_voice_file(final_text[:1000])
+                with open(path, 'rb') as f: 
+                    await context.bot.send_voice(chat_id, f)
                 os.remove(path)
-            except Exception as e: await context.bot.send_message(chat_id, f"TTS Error: {e}")
+            except Exception as e: 
+                await context.bot.send_message(chat_id, f"TTS Error: {e}")
 
     # --- ПРОСТОЕ СОХРАНЕНИЕ (ТОЛЬКО ПЕРЕВОД) ---
     # --- ИЗМЕНЕНИЕ: УМНОЕ СОХРАНЕНИЕ ПО ШАБЛОНУ ---
