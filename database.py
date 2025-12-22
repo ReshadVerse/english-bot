@@ -84,3 +84,12 @@ class Database:
                 "SELECT word, translation FROM words WHERE id = ?", 
                 (word_id,)
             ).fetchone()
+        
+    def snooze_word(self, word_id, hours=2):
+        """Временно откладывает слово, чтобы бот не спамил каждую минуту, пока ждет ответа."""
+        next_review = datetime.datetime.now() + datetime.timedelta(hours=hours)
+        with self.connection:
+            self.cursor.execute(
+                "UPDATE words SET next_review = ? WHERE id = ?", 
+                (next_review, word_id)
+            )

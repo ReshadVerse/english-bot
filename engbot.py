@@ -125,7 +125,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         word_id, user_id, word, translation, stage = row
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Помню", callback_data=f"rev_ok_{word_id}"),
+                 InlineKeyboardButton("✅ Помню", callback_data=f"rev_ok_{word_id}_{stage}"),
                 InlineKeyboardButton("❌ Забыл", callback_data=f"rev_bad_{word_id}")
             ],
             [InlineKeyboardButton("🗑 Удалить", callback_data=f"stop_{word_id}")]
@@ -136,6 +136,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 text=f"🔔 **Time to review!**\n\nКак переводится: **{word}**?",
                 reply_markup=kb, parse_mode="Markdown"
             )
+
+            db.snooze_word(word_id, hours=2)
         except Exception:
             pass 
 
@@ -156,11 +158,25 @@ async def show_my_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = "📚 **Твой словарь:**\n\n"
     for row in words:
         word, translation, stage = row
+        
+        # Очистка спецсимволов Markdown, чтобы не ломали разметку
         safe_word = str(word).replace('*', '').replace('_', '').replace('`', '')
-        safe_trans = str(translation).replace('*', '').replace('_', '').replace('`', '')
+        
+        # ХИТРОСТЬ: Берём только первую строку перевода (до переноса \n)
+        # Если в базе лежит: "Кошка\n(I saw a cat...)"
+        # Мы покажем только: "Кошка"
+        if "\n" in str(translation):
+            short_trans = str(translation).split('\n')[0]
+        else:
+            short_trans = str(translation)
+            
+        safe_trans = short_trans.replace('*', '').replace('_', '').replace('`', '')
+        
         level_icon = "🔥" * stage if stage < 4 else "🎓"
         
-        line = f"🔹 **{safe_word}** ({level_icon} {stage})\n   _{safe_trans}_\n\n"
+        # Формируем строку
+        line = f"🔹 **{safe_word}** {level_icon} {stage}\n   _{safe_trans}_\n\n"
+        
         if len(message_text) + len(line) > 4000:
             await update.message.reply_text(message_text, parse_mode="Markdown")
             message_text = ""
@@ -269,6 +285,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e: await context.bot.send_message(chat_id, f"TTS Error: {e}")
 
     # --- ПРОСТОЕ СОХРАНЕНИЕ (ТОЛЬКО ПЕРЕВОД) ---
+    # --- ИЗМЕНЕНИЕ: УМНОЕ СОХРАНЕНИЕ ПО ШАБЛОНУ ---
     elif data == "save":
         word = context.user_data.get('last_input')
         
@@ -277,35 +294,88 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id, action='typing')
 
         try:
-            # --- ИЗМЕНЕНИЕ 5: Новый вызов для перевода ---
+            # Мы просим Gemini создать форматированную строку специально для БД
+            prompt = (
+                f"Создай словарную карточку для слова/фразы: '{word}'. "
+                f"Формат строго такой:\n"
+                f"{word} — [Краткий перевод]\n"
+                f"([Короткое предложение-пример на английском с этим словом] — [Перевод предложения на русский])\n\n"
+                f"Не пиши ничего лишнего, только эти две строки."
+            )
+
             r = await client.aio.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=f"Translate '{word}' to Russian. Return ONLY the translation words. No definitions."
+                contents=prompt
             )
-            trans = r.text.strip()
-        except:
-            trans = "..."
+            
+            # Получаем красивый текст:
+            # Opportunity — Возможность
+            # (I missed the opportunity to travel. — Я упустил возможность попутешествовать.)
+            full_card = r.text.strip()
+            
+            # Разделяем для удобства (первая строка - перевод, остальное - пример)
+            lines = full_card.split('\n')
+            translation_part = lines[0].split('—')[-1].strip() if '—' in lines[0] else lines[0]
+            
+            # Но в базу мы запишем ВЕСЬ шаблон в поле translation, 
+            # чтобы потом при выводе видеть всё сразу.
+            # ЛИБО (лучший вариант): В translation пишем первую строку, а пример добавим к ней.
+            
+        except Exception as e:
+            full_card = f"{word} — Перевод не найден"
+            print(f"Error generating card: {e}")
 
-        if db.add_word(chat_id, word, trans):
-            await context.bot.send_message(chat_id, f"✅ Сохранено: **{word}** — {trans}", parse_mode="Markdown")
+        # Сохраняем в БД именно отформатированный шаблон
+        # Обрати внимание: word остается оригинальным (для поиска), 
+        # а в translation мы пишем всё то, что сгенерировала нейронка (перевод + пример)
+        # Нам придется чуть схитрить: в поле translation запишем строку "Перевод\n(Пример)"
+        
+        # Уберем само слово из начала строки перевода, чтобы не дублировать в базе
+        # Gemini вернет: "Word - Translation..."
+        # Нам в базу в колонку 'translation' нужно записать: "Translation\n(Example...)"
+        
+        final_translation_content = full_card.replace(f"{word} — ", "", 1).replace(f"{word} - ", "", 1)
+
+        if db.add_word(chat_id, word, final_translation_content):
+            await context.bot.send_message(
+                chat_id, 
+                f"✅ **Сохраненo:**\n\n📌 **{word}** — {final_translation_content}", 
+                parse_mode="Markdown"
+            )
         else:
             await context.bot.send_message(chat_id, "⚠ Такое слово уже есть.")
     # 3. ИНТЕРВАЛЬНОЕ ПОВТОРЕНИЕ
     elif data.startswith("rev_ok_"):
-        wid = int(data.split("_")[-1])
+        parts = data.split("_")
+        wid = int(parts[2])
         
+        # Пытаемся получить стадию из кнопки, если старые кнопки - считаем 1
+        try:
+            current_stage = int(parts[3])
+        except IndexError:
+            current_stage = 1
+
         row = db.get_word_by_id(wid)
         
-        db.update_word_stage(wid, 2) 
+        # Логика: следующий уровень
+        new_stage = current_stage + 1
+        
+        db.update_word_stage(wid, new_stage) 
         
         if row:
             word, translation = row
+            # Разделяем перевод и пример для красоты вывода (если там есть перенос строки)
+            if "\n" in translation:
+                clean_trans = translation.split("\n")[0] # Берем только первую строку для краткости
+            else:
+                clean_trans = translation
+
             await query.edit_message_text(
-                f"🎉 Красавчик!\n\n✅ **{word}** — {translation}\n\n(Увидимся через 3 дня)",
+                f"🎉 Красавчик! (+ ур. {new_stage})\n\n✅ **{word}** — {clean_trans}",
                 parse_mode="Markdown"
             )
         else:
-            await query.edit_message_text("🎉 Молодец! (Слово удалено, но я засчитал)")
+            await query.edit_message_text("🎉 Молодец! (Слово удалено)")
     
     elif data.startswith("rev_bad_"):
         wid = int(data.split("_")[-1])
